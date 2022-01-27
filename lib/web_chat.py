@@ -8,6 +8,7 @@ from ctypes import *
 from pathlib import Path
 from asyncio import set_event_loop_policy, WindowsSelectorEventLoopPolicy, new_event_loop, \
     CancelledError, set_event_loop, run as arun, sleep as asleep
+from queue import Queue, Empty
 from threading import Thread
 
 from aiohttp import web, WSMsgType
@@ -88,13 +89,14 @@ def run(host: str, port: int):
     print_chat_log_offset = find_signature_address("40 55 53 56 41 54 41 57 48 8D AC 24 ?? ?? ?? ?? 48 81 EC 20 02 00 00 48 8B 05")
     do_text_command_offset = find_signature_address("48 89 5C 24 ? 57 48 83 EC 20 48 8B FA 48 8B D9 45 84 C9")
     text_command_ui_module_offset = find_signature_point("48 8B 05 * * * * 48 8B D9 8B 40 14 85 C0")
-    player_name_addr = find_signature_point("48 8D 0D * * * * E8 ? ? ? ? 0F B6 F0 0F B6 05 ? ? ? ?") + 1 + BASE_ADDR
+    player_name_addr = find_signature_point("48 8D 0D * * * * E8 ? ? ? ? 0F B6 F0 0F B6 05") + 1 + BASE_ADDR
+    frame_inject_offset = find_signature_address("4C 8B DC 53 56 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 ? ? ? ? 48 83 B9")
 
     def player_name():
         return read_string(player_name_addr)
 
-    from .memory.struct_factory import PointerStruct, OffsetStruct
-    ui_module = read_memory(POINTER(c_void_p), text_command_ui_module_offset + BASE_ADDR)
+    from .memory.struct_factory import OffsetStruct
+    ui_module = read_memory(POINTER(c_int64), text_command_ui_module_offset + BASE_ADDR)
     _do_text_command = CFUNCTYPE(c_int64, c_void_p, c_void_p, c_int64, c_char)(do_text_command_offset + BASE_ADDR)
     TextCommandStruct = OffsetStruct({"cmd": c_void_p, "t1": c_longlong, "tLength": c_longlong, "t3": c_longlong}, full_size=400)
 
@@ -111,7 +113,6 @@ def run(host: str, port: int):
     class PrintChatLogHook(Hook):
         restype = c_int64
         argtypes = [c_int64, c_ushort, POINTER(c_char_p), POINTER(c_char_p), c_uint, c_ubyte]
-        auto_install = True
 
         def __init__(self, func_address: int):
             super().__init__(func_address)
@@ -127,6 +128,20 @@ def run(host: str, port: int):
             except:
                 pass
             return self.original(manager, channel_id, p_sender, p_msg, sender_id, parm)
+
+    frame_works = Queue()
+
+    class FrameInjectHook(Hook):
+        argtypes = [c_void_p, c_void_p]
+
+        def hook_function(self, *oargs):
+            try:
+                while True:
+                    call, args, kwargs = frame_works.get(block=False)
+                    call(*args, **kwargs)
+            except Empty:
+                pass
+            return self.original(*oargs)
 
     clients = dict()
     client_count = 0
@@ -147,15 +162,7 @@ def run(host: str, port: int):
                 await ws.send_json(m)
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
-                    try:
-                        do_text_command(msg.data)
-                    except Exception as e:
-                        await ws.send_json({
-                            'epoch': time.time(),
-                            'sender': [{'type': 'text', 'data': 'error'}],
-                            'text': [{'type': 'text', 'data': str(e)}],
-                            'channel': -1,
-                        })
+                    frame_works.put((do_text_command, (msg.data,), {}))
                 elif msg.type == WSMsgType.ERROR:
                     pass
         except CancelledError:
@@ -194,6 +201,8 @@ def run(host: str, port: int):
 
     hook = PrintChatLogHook(print_chat_log_offset + BASE_ADDR)
     hook.install_and_enable()
+    frame_hook = FrameInjectHook(frame_inject_offset + BASE_ADDR)
+    frame_hook.install_and_enable()
     loop = new_event_loop()
     set_event_loop(loop)
     loop.run_until_complete(main())
